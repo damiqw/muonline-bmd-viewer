@@ -1451,6 +1451,237 @@ class App {
         requestAnimationFrame(captureFrame);
     }
 
+    private async exportAllFoldersGifs() {
+        if (!this.folderFiles || this.folderFiles.length === 0) {
+            alert('Load a folder with BMD files first.');
+            return;
+        }
+
+        if (this.isRecordingGif) {
+            alert('GIF export already in progress.');
+            return;
+        }
+
+        const exportAllGifsBtn = document.getElementById('export-all-gifs-btn') as HTMLButtonElement | null;
+        const status = document.getElementById('status')!;
+        
+        const originalBtnText = exportAllGifsBtn?.textContent || 'Export All GIFs';
+
+        // Get export settings from current UI values
+        const w = Math.max(16, Math.min(1024, parseInt(this.gifWidthInput?.value ?? '800', 10) || 800));
+        const h = Math.max(16, Math.min(1024, parseInt(this.gifHeightInput?.value ?? '600', 10) || 600));
+        const requestedDelay = parseInt(this.gifDelayInput?.value ?? '', 10);
+        const userDelay = !Number.isNaN(requestedDelay) && requestedDelay > 0 ? requestedDelay : null;
+        const frameMultiplier = Math.max(1, Math.min(8, parseInt(this.gifFrameMultiplierInput?.value ?? '1', 10) || 1));
+
+        const totalModels = this.folderFiles.length;
+        let successCount = 0;
+        let failureCount = 0;
+
+        this.isRecordingGif = true;
+        if (exportAllGifsBtn) exportAllGifsBtn.disabled = true;
+
+        // Save initial state
+        const initialBmdFile = this.bmdFile;
+
+        for (let i = 0; i < totalModels; i++) {
+            const file = this.folderFiles[i];
+            const modelName = file.name.replace(/\.bmd$/i, '');
+            
+            try {
+                status.textContent = `Exporting ${i + 1}/${totalModels}: ${modelName}…`;
+                
+                // Load the model (always clear scene to avoid stacking objects)
+                this.bmdFile = file;
+                await this.loadAndDisplayModel({ 
+                    textureFiles: this.folderTextureFiles,
+                    suppressRecent: true,
+                    skipClear: false
+                });
+
+                // Wait a frame to ensure scene is rendered
+                await new Promise(resolve => requestAnimationFrame(resolve));
+
+                // Export GIF for this model
+                await this.renderGifToBlob(w, h, userDelay, frameMultiplier, modelName);
+                
+                successCount++;
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error);
+                logger.error(`Failed to export GIF for ${modelName}:`, msg);
+                failureCount++;
+            }
+        }
+
+        // Restore initial state
+        this.bmdFile = initialBmdFile;
+
+        this.isRecordingGif = false;
+        if (exportAllGifsBtn) {
+            exportAllGifsBtn.disabled = false;
+            exportAllGifsBtn.textContent = originalBtnText;
+        }
+
+        status.textContent = `Batch export complete: ${successCount} succeeded, ${failureCount} failed.`;
+    }
+
+    private renderGifToBlob(
+        w: number,
+        h: number,
+        userDelay: number | null,
+        frameMultiplier: number,
+        modelName: string
+    ): Promise<void> {
+        return new Promise((resolve, reject) => {
+            try {
+                if (!this.loadedGroup) {
+                    reject(new Error('No model loaded'));
+                    return;
+                }
+
+                const tmpCanvas = document.createElement('canvas');
+                tmpCanvas.width = w;
+                tmpCanvas.height = h;
+                const tmpCtx = tmpCanvas.getContext('2d')!;
+
+                const transparentColor = 0x00ff00;
+                const trR = (transparentColor >> 16) & 0xff;
+                const trG = (transparentColor >> 8) & 0xff;
+                const trB = transparentColor & 0xff;
+
+                const gif = new GIF({
+                    workers: 2,
+                    workerScript: gifWorkerUrl,
+                    quality: 10,
+                    width: w,
+                    height: h,
+                    transparent: transparentColor,
+                } as any);
+
+                const oldBg = this.scene.background
+                    ? (this.scene.background as THREE.Color).clone()
+                    : null;
+                this.scene.background = null;
+
+                const oldGridVisible = this.gridHelper?.visible ?? false;
+                if (this.gridHelper) this.gridHelper.visible = false;
+
+                const speedSliderEl = document.getElementById('speed-slider') as HTMLInputElement | null;
+                const timeScale = parseFloat(speedSliderEl?.value ?? '1') || 1;
+                const hasAnim = !!(this.currentAction && this.mixer);
+
+                let clip: (THREE.AnimationClip & { userData?: { numAnimationKeys?: number } }) | null = null;
+                let numKeys = 0;
+
+                if (hasAnim && this.currentAction) {
+                    clip = this.currentAction.getClip() as THREE.AnimationClip & {
+                        userData?: { numAnimationKeys?: number }
+                    };
+                    numKeys = clip.userData?.numAnimationKeys ?? 0;
+                }
+
+                gif.on('finished', (blob: Blob) => {
+                    if (oldBg) this.scene.background = oldBg;
+                    else this.scene.background = null;
+                    if (this.gridHelper) this.gridHelper.visible = oldGridVisible;
+
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${modelName}_${w}x${h}.gif`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+
+                    resolve();
+                });
+
+                gif.on('abort', () => {
+                    if (oldBg) this.scene.background = oldBg;
+                    else this.scene.background = null;
+                    if (this.gridHelper) this.gridHelper.visible = oldGridVisible;
+                    reject(new Error('GIF rendering aborted'));
+                });
+
+                // Render frames
+                if (!hasAnim || !clip || numKeys === 0) {
+                    this.renderer.render(this.scene, this.camera);
+                    tmpCtx.clearRect(0, 0, w, h);
+                    tmpCtx.drawImage(this.renderer.domElement, 0, 0, w, h);
+
+                    const imgData = tmpCtx.getImageData(0, 0, w, h);
+                    const data = imgData.data;
+                    const alphaThreshold = 40;
+                    for (let i = 0; i < data.length; i += 4) {
+                        if (data[i + 3] < alphaThreshold) {
+                            data[i] = trR;
+                            data[i + 1] = trG;
+                            data[i + 2] = trB;
+                            data[i + 3] = 255;
+                        }
+                    }
+                    tmpCtx.putImageData(imgData, 0, 0);
+                    gif.addFrame(tmpCtx, {
+                        copy: true,
+                        delay: Math.min(Math.max(userDelay ?? 120, 10), 1000),
+                    });
+                    gif.render();
+                    return;
+                }
+
+                const totalFrames = Math.max(1, numKeys * frameMultiplier);
+                const effectiveTimeScale =
+                    (this.currentAction as any)._effectiveTimeScale ?? timeScale;
+                const autoDelayMs =
+                    (clip.duration / Math.max(effectiveTimeScale, 0.0001)) / totalFrames * 1000;
+                const frameDelay = Math.min(
+                    Math.max(userDelay ?? Math.round(autoDelayMs), 5),
+                    1000,
+                );
+
+                let frameIndex = 0;
+                const captureFrame = () => {
+                    if (frameIndex >= totalFrames) {
+                        gif.render();
+                        return;
+                    }
+
+                    const t = (frameIndex / totalFrames) * clip!.duration;
+                    this.currentAction!.time = t;
+                    this.mixer!.update(0);
+
+                    this.renderer.render(this.scene, this.camera);
+                    tmpCtx.clearRect(0, 0, w, h);
+                    tmpCtx.drawImage(this.renderer.domElement, 0, 0, w, h);
+
+                    const imgData = tmpCtx.getImageData(0, 0, w, h);
+                    const data = imgData.data;
+                    const alphaThreshold = 40;
+                    for (let i = 0; i < data.length; i += 4) {
+                        if (data[i + 3] < alphaThreshold) {
+                            data[i] = trR;
+                            data[i + 1] = trG;
+                            data[i + 2] = trB;
+                            data[i + 3] = 255;
+                        }
+                    }
+                    tmpCtx.putImageData(imgData, 0, 0);
+
+                    gif.addFrame(tmpCtx, {
+                        copy: true,
+                        delay: frameDelay,
+                    });
+
+                    frameIndex++;
+                    requestAnimationFrame(captureFrame);
+                };
+
+                requestAnimationFrame(captureFrame);
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
     //----------------------------------------------------------
     // MODEL LOADING - Modified
     //----------------------------------------------------------
@@ -1935,6 +2166,7 @@ class App {
         const zone = document.getElementById('folder-bmd-drop-zone')!;
         const input = document.getElementById('folder-bmd-input') as HTMLInputElement;
         const closeBtn = document.getElementById('folder-browser-close')!;
+        const exportAllGifsBtn = document.getElementById('export-all-gifs-btn') as HTMLButtonElement | null;
 
         zone.addEventListener('click', () => input.click());
         zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over'); });
@@ -1950,6 +2182,10 @@ class App {
             input.value = '';
         });
         closeBtn.addEventListener('click', () => this.closeFolderPanel());
+        
+        if (exportAllGifsBtn) {
+            exportAllGifsBtn.addEventListener('click', () => this.exportAllFoldersGifs());
+        }
     }
 
     // -- folder loading --------------------------------------------------
